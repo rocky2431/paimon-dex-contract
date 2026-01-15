@@ -69,12 +69,53 @@ contract PaimonFactoryTest is Test {
         factory.setFeeTo(address(0x123));
     }
 
-    function test_SetFeeToSetter() public {
+    function test_TwoStepOwnershipTransfer() public {
         address newFeeToSetter = address(0x456);
 
+        // Step 1: Propose new feeToSetter
+        vm.prank(feeToSetter);
+        factory.proposeFeeToSetter(newFeeToSetter);
+
+        // feeToSetter should not change yet
+        assertEq(factory.feeToSetter(), feeToSetter);
+        assertEq(factory.pendingFeeToSetter(), newFeeToSetter);
+
+        // Step 2: Accept the role
+        vm.prank(newFeeToSetter);
+        factory.acceptFeeToSetter();
+
+        assertEq(factory.feeToSetter(), newFeeToSetter);
+        assertEq(factory.pendingFeeToSetter(), address(0));
+    }
+
+    function test_SetFeeToSetter_LegacyProposesOnly() public {
+        address newFeeToSetter = address(0x456);
+
+        // Legacy setFeeToSetter now just proposes
         vm.prank(feeToSetter);
         factory.setFeeToSetter(newFeeToSetter);
 
-        assertEq(factory.feeToSetter(), newFeeToSetter);
+        // feeToSetter should not change, only pending
+        assertEq(factory.feeToSetter(), feeToSetter);
+        assertEq(factory.pendingFeeToSetter(), newFeeToSetter);
+    }
+
+    function test_RevertWhen_AcceptFeeToSetter_NotPending() public {
+        address randomAddress = address(0x789);
+
+        vm.prank(randomAddress);
+        vm.expectRevert(PaimonFactory.Forbidden.selector);
+        factory.acceptFeeToSetter();
+    }
+
+    function test_RevertWhen_ProposeFeeToSetter_ZeroAddress() public {
+        vm.prank(feeToSetter);
+        vm.expectRevert(PaimonFactory.ZeroAddress.selector);
+        factory.proposeFeeToSetter(address(0));
+    }
+
+    function test_RevertWhen_Constructor_ZeroAddress() public {
+        vm.expectRevert(PaimonFactory.ZeroAddress.selector);
+        new PaimonFactory(address(0));
     }
 }

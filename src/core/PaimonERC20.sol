@@ -14,16 +14,38 @@ contract PaimonERC20 is IPaimonERC20 {
     mapping(address => uint256) public balanceOf;
     mapping(address => mapping(address => uint256)) public allowance;
 
-    bytes32 public immutable DOMAIN_SEPARATOR;
+    /// @notice Cached DOMAIN_SEPARATOR for gas optimization
+    bytes32 private immutable _CACHED_DOMAIN_SEPARATOR;
+    /// @notice Cached chain ID to detect chain forks
+    uint256 private immutable _CACHED_CHAIN_ID;
+    /// @notice Cached address for DOMAIN_SEPARATOR computation
+    address private immutable _CACHED_THIS;
+
     // keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)")
     bytes32 public constant PERMIT_TYPEHASH = 0x6e71edae12b1b97f4d1f60370fef10105fa2faae0126114a169c64845d6126c9;
     mapping(address => uint256) public nonces;
 
     error Expired();
     error InvalidSignature();
+    error ZeroAddress();
 
     constructor() {
-        DOMAIN_SEPARATOR = keccak256(
+        _CACHED_CHAIN_ID = block.chainid;
+        _CACHED_THIS = address(this);
+        _CACHED_DOMAIN_SEPARATOR = _computeDomainSeparator();
+    }
+
+    /// @notice Returns the domain separator, recomputing if chain ID changed (fork protection)
+    function DOMAIN_SEPARATOR() public view returns (bytes32) {
+        if (block.chainid == _CACHED_CHAIN_ID) {
+            return _CACHED_DOMAIN_SEPARATOR;
+        }
+        return _computeDomainSeparator();
+    }
+
+    /// @dev Computes the EIP-712 domain separator
+    function _computeDomainSeparator() private view returns (bytes32) {
+        return keccak256(
             abi.encode(
                 keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
                 keccak256(bytes(name)),
@@ -85,12 +107,14 @@ contract PaimonERC20 is IPaimonERC20 {
         bytes32 r,
         bytes32 s
     ) external {
+        if (owner == address(0)) revert ZeroAddress();
+        if (spender == address(0)) revert ZeroAddress();
         if (deadline < block.timestamp) revert Expired();
 
         bytes32 digest = keccak256(
             abi.encodePacked(
                 "\x19\x01",
-                DOMAIN_SEPARATOR,
+                DOMAIN_SEPARATOR(),
                 keccak256(abi.encode(PERMIT_TYPEHASH, owner, spender, value, nonces[owner]++, deadline))
             )
         );

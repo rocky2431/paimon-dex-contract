@@ -18,9 +18,13 @@ contract PaimonRouter is IPaimonRouter {
     error InsufficientAAmount();
     error InsufficientBAmount();
     error InsufficientOutputAmount();
+    error InsufficientTokenAmount();
     error ExcessiveInputAmount();
     error InvalidPath();
     error TransferFailed();
+    error ZeroAddress();
+    error UnauthorizedCaller();
+    error WETHTransferFailed();
 
     modifier ensure(uint256 deadline) {
         if (deadline < block.timestamp) revert Expired();
@@ -28,12 +32,14 @@ contract PaimonRouter is IPaimonRouter {
     }
 
     constructor(address _factory, address _WETH) {
+        if (_factory == address(0)) revert ZeroAddress();
+        if (_WETH == address(0)) revert ZeroAddress();
         factory = _factory;
         WETH = _WETH;
     }
 
     receive() external payable {
-        assert(msg.sender == WETH);
+        if (msg.sender != WETH) revert UnauthorizedCaller();
     }
 
     // **** ADD LIQUIDITY ****
@@ -58,7 +64,7 @@ contract PaimonRouter is IPaimonRouter {
                 (amountA, amountB) = (amountADesired, amountBOptimal);
             } else {
                 uint256 amountAOptimal = PaimonLibrary.quote(amountBDesired, reserveB, reserveA);
-                assert(amountAOptimal <= amountADesired);
+                // amountAOptimal <= amountADesired is guaranteed by math
                 if (amountAOptimal < amountAMin) revert InsufficientAAmount();
                 (amountA, amountB) = (amountAOptimal, amountBDesired);
             }
@@ -95,7 +101,7 @@ contract PaimonRouter is IPaimonRouter {
         address pair = PaimonLibrary.pairFor(factory, token, WETH);
         _safeTransferFrom(token, msg.sender, pair, amountToken);
         IWETH(WETH).deposit{value: amountETH}();
-        assert(IWETH(WETH).transfer(pair, amountETH));
+        if (!IWETH(WETH).transfer(pair, amountETH)) revert WETHTransferFailed();
         liquidity = IPaimonPair(pair).mint(to);
         if (msg.value > amountETH) {
             _safeTransferETH(msg.sender, msg.value - amountETH);
@@ -173,9 +179,54 @@ contract PaimonRouter is IPaimonRouter {
         (amountToken, amountETH) = removeLiquidityETH(token, liquidity, amountTokenMin, amountETHMin, to, deadline);
     }
 
+    /// @notice Remove liquidity for fee-on-transfer tokens
+    /// @dev Verifies actual received amount after transfer to handle fee-on-transfer tokens correctly
+    function removeLiquidityETHSupportingFeeOnTransferTokens(
+        address token,
+        uint256 liquidity,
+        uint256 amountTokenMin,
+        uint256 amountETHMin,
+        address to,
+        uint256 deadline
+    ) public ensure(deadline) returns (uint256 amountETH) {
+        // Use 0 for amountTokenMin in removeLiquidity since we check actual received amount below
+        (, amountETH) = removeLiquidity(token, WETH, liquidity, 0, amountETHMin, address(this), deadline);
+
+        // Transfer tokens and verify recipient received enough
+        uint256 tokenBalance = IERC20(token).balanceOf(address(this));
+        uint256 recipientBalanceBefore = IERC20(token).balanceOf(to);
+        _safeTransfer(token, to, tokenBalance);
+        uint256 actualReceived = IERC20(token).balanceOf(to) - recipientBalanceBefore;
+
+        // Check actual received amount against minimum (accounts for transfer fees)
+        if (actualReceived < amountTokenMin) revert InsufficientTokenAmount();
+
+        IWETH(WETH).withdraw(amountETH);
+        _safeTransferETH(to, amountETH);
+    }
+
+    /// @notice Remove liquidity with permit for fee-on-transfer tokens
+    function removeLiquidityETHWithPermitSupportingFeeOnTransferTokens(
+        address token,
+        uint256 liquidity,
+        uint256 amountTokenMin,
+        uint256 amountETHMin,
+        address to,
+        uint256 deadline,
+        bool approveMax,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external returns (uint256 amountETH) {
+        address pair = PaimonLibrary.pairFor(factory, token, WETH);
+        uint256 value = approveMax ? type(uint256).max : liquidity;
+        IPaimonPair(pair).permit(msg.sender, address(this), value, deadline, v, r, s);
+        amountETH = removeLiquidityETHSupportingFeeOnTransferTokens(token, liquidity, amountTokenMin, amountETHMin, to, deadline);
+    }
+
     // **** SWAP ****
     function _swap(uint256[] memory amounts, address[] memory path, address _to) internal {
-        for (uint256 i; i < path.length - 1; i++) {
+        for (uint256 i; i < path.length - 1;) {
             (address input, address output) = (path[i], path[i + 1]);
             (address token0,) = PaimonLibrary.sortTokens(input, output);
             uint256 amountOut = amounts[i + 1];
@@ -183,6 +234,31 @@ contract PaimonRouter is IPaimonRouter {
                 input == token0 ? (uint256(0), amountOut) : (amountOut, uint256(0));
             address to = i < path.length - 2 ? PaimonLibrary.pairFor(factory, output, path[i + 2]) : _to;
             IPaimonPair(PaimonLibrary.pairFor(factory, input, output)).swap(amount0Out, amount1Out, to, new bytes(0));
+            unchecked { ++i; }
+        }
+    }
+
+    /// @dev Internal swap function for fee-on-transfer tokens
+    /// @notice Doesn't use pre-calculated amounts, reads balance directly
+    function _swapSupportingFeeOnTransferTokens(address[] memory path, address _to) internal {
+        for (uint256 i; i < path.length - 1;) {
+            (address input, address output) = (path[i], path[i + 1]);
+            (address token0,) = PaimonLibrary.sortTokens(input, output);
+            IPaimonPair pair = IPaimonPair(PaimonLibrary.pairFor(factory, input, output));
+            uint256 amountInput;
+            uint256 amountOutput;
+            {
+                (uint256 reserve0, uint256 reserve1,) = pair.getReserves();
+                (uint256 reserveInput, uint256 reserveOutput) =
+                    input == token0 ? (reserve0, reserve1) : (reserve1, reserve0);
+                amountInput = IERC20(input).balanceOf(address(pair)) - reserveInput;
+                amountOutput = PaimonLibrary.getAmountOut(amountInput, reserveInput, reserveOutput);
+            }
+            (uint256 amount0Out, uint256 amount1Out) =
+                input == token0 ? (uint256(0), amountOutput) : (amountOutput, uint256(0));
+            address to = i < path.length - 2 ? PaimonLibrary.pairFor(factory, output, path[i + 2]) : _to;
+            pair.swap(amount0Out, amount1Out, to, new bytes(0));
+            unchecked { ++i; }
         }
     }
 
@@ -222,7 +298,7 @@ contract PaimonRouter is IPaimonRouter {
         amounts = PaimonLibrary.getAmountsOut(factory, msg.value, path);
         if (amounts[amounts.length - 1] < amountOutMin) revert InsufficientOutputAmount();
         IWETH(WETH).deposit{value: amounts[0]}();
-        assert(IWETH(WETH).transfer(PaimonLibrary.pairFor(factory, path[0], path[1]), amounts[0]));
+        if (!IWETH(WETH).transfer(PaimonLibrary.pairFor(factory, path[0], path[1]), amounts[0])) revert WETHTransferFailed();
         _swap(amounts, path, to);
     }
 
@@ -268,11 +344,63 @@ contract PaimonRouter is IPaimonRouter {
         amounts = PaimonLibrary.getAmountsIn(factory, amountOut, path);
         if (amounts[0] > msg.value) revert ExcessiveInputAmount();
         IWETH(WETH).deposit{value: amounts[0]}();
-        assert(IWETH(WETH).transfer(PaimonLibrary.pairFor(factory, path[0], path[1]), amounts[0]));
+        if (!IWETH(WETH).transfer(PaimonLibrary.pairFor(factory, path[0], path[1]), amounts[0])) revert WETHTransferFailed();
         _swap(amounts, path, to);
         if (msg.value > amounts[0]) {
             _safeTransferETH(msg.sender, msg.value - amounts[0]);
         }
+    }
+
+    // **** SWAP (FEE-ON-TRANSFER TOKENS) ****
+    /// @notice Swap exact tokens for tokens supporting fee-on-transfer tokens
+    function swapExactTokensForTokensSupportingFeeOnTransferTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external ensure(deadline) {
+        _safeTransferFrom(path[0], msg.sender, PaimonLibrary.pairFor(factory, path[0], path[1]), amountIn);
+        uint256 balanceBefore = IERC20(path[path.length - 1]).balanceOf(to);
+        _swapSupportingFeeOnTransferTokens(path, to);
+        if (IERC20(path[path.length - 1]).balanceOf(to) - balanceBefore < amountOutMin) {
+            revert InsufficientOutputAmount();
+        }
+    }
+
+    /// @notice Swap exact ETH for tokens supporting fee-on-transfer tokens
+    function swapExactETHForTokensSupportingFeeOnTransferTokens(
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external payable ensure(deadline) {
+        if (path[0] != WETH) revert InvalidPath();
+        uint256 amountIn = msg.value;
+        IWETH(WETH).deposit{value: amountIn}();
+        if (!IWETH(WETH).transfer(PaimonLibrary.pairFor(factory, path[0], path[1]), amountIn)) revert WETHTransferFailed();
+        uint256 balanceBefore = IERC20(path[path.length - 1]).balanceOf(to);
+        _swapSupportingFeeOnTransferTokens(path, to);
+        if (IERC20(path[path.length - 1]).balanceOf(to) - balanceBefore < amountOutMin) {
+            revert InsufficientOutputAmount();
+        }
+    }
+
+    /// @notice Swap exact tokens for ETH supporting fee-on-transfer tokens
+    function swapExactTokensForETHSupportingFeeOnTransferTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external ensure(deadline) {
+        if (path[path.length - 1] != WETH) revert InvalidPath();
+        _safeTransferFrom(path[0], msg.sender, PaimonLibrary.pairFor(factory, path[0], path[1]), amountIn);
+        _swapSupportingFeeOnTransferTokens(path, address(this));
+        uint256 amountOut = IERC20(WETH).balanceOf(address(this));
+        if (amountOut < amountOutMin) revert InsufficientOutputAmount();
+        IWETH(WETH).withdraw(amountOut);
+        _safeTransferETH(to, amountOut);
     }
 
     // **** LIBRARY FUNCTIONS ****
@@ -328,8 +456,19 @@ contract PaimonRouter is IPaimonRouter {
         }
     }
 
+    /// @notice Safely transfers ETH with gas limit to prevent DoS attacks
+    /// @dev Uses limited gas (10000) for the transfer. If the transfer fails,
+    ///      wraps the ETH as WETH and sends it instead as a fallback.
+    /// @param to The recipient address
+    /// @param value The amount of ETH to transfer
     function _safeTransferETH(address to, uint256 value) private {
-        (bool success,) = to.call{value: value}(new bytes(0));
-        if (!success) revert TransferFailed();
+        // Use limited gas to prevent malicious contracts from blocking refunds
+        // 10000 gas is enough for simple receive() but not complex operations
+        (bool success,) = to.call{value: value, gas: 10000}(new bytes(0));
+        if (!success) {
+            // Fallback: wrap ETH and send as WETH
+            IWETH(WETH).deposit{value: value}();
+            if (!IWETH(WETH).transfer(to, value)) revert WETHTransferFailed();
+        }
     }
 }

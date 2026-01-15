@@ -9,6 +9,7 @@ import "./PaimonPair.sol";
 contract PaimonFactory is IPaimonFactory {
     address public feeTo;
     address public feeToSetter;
+    address public pendingFeeToSetter;
 
     mapping(address => mapping(address => address)) public getPair;
     address[] public allPairs;
@@ -17,8 +18,19 @@ contract PaimonFactory is IPaimonFactory {
     error ZeroAddress();
     error PairExists();
     error Forbidden();
+    error NoPendingOwner();
+
+    /// @notice Emitted when the fee recipient is updated
+    event FeeToUpdated(address indexed oldFeeTo, address indexed newFeeTo);
+
+    /// @notice Emitted when a new feeToSetter is proposed
+    event FeeToSetterProposed(address indexed currentSetter, address indexed proposedSetter);
+
+    /// @notice Emitted when the feeToSetter transfer is completed
+    event FeeToSetterUpdated(address indexed oldSetter, address indexed newSetter);
 
     constructor(address _feeToSetter) {
+        if (_feeToSetter == address(0)) revert ZeroAddress();
         feeToSetter = _feeToSetter;
     }
 
@@ -44,11 +56,36 @@ contract PaimonFactory is IPaimonFactory {
 
     function setFeeTo(address _feeTo) external {
         if (msg.sender != feeToSetter) revert Forbidden();
+        address oldFeeTo = feeTo;
         feeTo = _feeTo;
+        emit FeeToUpdated(oldFeeTo, _feeTo);
     }
 
+    /// @notice Proposes a new feeToSetter (first step of two-step transfer)
+    /// @param _feeToSetter The address of the proposed new feeToSetter
+    function proposeFeeToSetter(address _feeToSetter) external {
+        if (msg.sender != feeToSetter) revert Forbidden();
+        if (_feeToSetter == address(0)) revert ZeroAddress();
+        pendingFeeToSetter = _feeToSetter;
+        emit FeeToSetterProposed(feeToSetter, _feeToSetter);
+    }
+
+    /// @notice Accepts the feeToSetter role (second step of two-step transfer)
+    function acceptFeeToSetter() external {
+        if (msg.sender != pendingFeeToSetter) revert Forbidden();
+        if (pendingFeeToSetter == address(0)) revert NoPendingOwner();
+        address oldSetter = feeToSetter;
+        feeToSetter = pendingFeeToSetter;
+        pendingFeeToSetter = address(0);
+        emit FeeToSetterUpdated(oldSetter, feeToSetter);
+    }
+
+    /// @notice Legacy function for backward compatibility - now requires two-step transfer
+    /// @dev Deprecated: Use proposeFeeToSetter + acceptFeeToSetter instead
     function setFeeToSetter(address _feeToSetter) external {
         if (msg.sender != feeToSetter) revert Forbidden();
-        feeToSetter = _feeToSetter;
+        if (_feeToSetter == address(0)) revert ZeroAddress();
+        pendingFeeToSetter = _feeToSetter;
+        emit FeeToSetterProposed(feeToSetter, _feeToSetter);
     }
 }

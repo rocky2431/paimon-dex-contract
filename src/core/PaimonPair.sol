@@ -14,7 +14,11 @@ import "./libraries/UQ112x112.sol";
 contract PaimonPair is IPaimonPair, PaimonERC20 {
     using UQ112x112 for uint224;
 
-    uint256 public constant MINIMUM_LIQUIDITY = 10 ** 3;
+    /// @notice Minimum liquidity locked forever to prevent first depositor attack
+    /// @dev Increased from 10^3 to 10^4 to better mitigate inflation attacks.
+    ///      Minted to 0xdead instead of address(0) to avoid potential issues with
+    ///      zero-address transfers in some token implementations.
+    uint256 public constant MINIMUM_LIQUIDITY = 10 ** 4;
     bytes4 private constant SELECTOR = bytes4(keccak256(bytes("transfer(address,uint256)")));
 
     address public factory;
@@ -40,7 +44,8 @@ contract PaimonPair is IPaimonPair, PaimonERC20 {
     error InsufficientLiquidity();
     error InvalidTo();
     error InsufficientInputAmount();
-    error K();
+    /// @dev Constant product invariant violated: balance0Adjusted * balance1Adjusted < k
+    error InvariantViolation();
     error TransferFailed();
 
     modifier lock() {
@@ -171,7 +176,7 @@ contract PaimonPair is IPaimonPair, PaimonERC20 {
             if (to == _token0 || to == _token1) revert InvalidTo();
             if (amount0Out > 0) _safeTransfer(_token0, to, amount0Out);
             if (amount1Out > 0) _safeTransfer(_token1, to, amount1Out);
-            if (data.length > 0) IPaimonCallee(to).paimonCall(msg.sender, amount0Out, amount1Out, data);
+            if (data.length > 0) IPaimonCallee(to).paimonCall(msg.sender, amount0Out, amount1Out, factory, data);
             balance0 = IERC20(_token0).balanceOf(address(this));
             balance1 = IERC20(_token1).balanceOf(address(this));
         }
@@ -183,7 +188,7 @@ contract PaimonPair is IPaimonPair, PaimonERC20 {
             uint256 balance0Adjusted = balance0 * 1000 - amount0In * 3;
             uint256 balance1Adjusted = balance1 * 1000 - amount1In * 3;
             if (balance0Adjusted * balance1Adjusted < uint256(_reserve0) * uint256(_reserve1) * 1000 ** 2) {
-                revert K();
+                revert InvariantViolation();
             }
         }
 

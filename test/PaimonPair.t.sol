@@ -16,7 +16,7 @@ contract PaimonPairTest is Test {
     address public alice = address(0x1);
     address public bob = address(0x2);
 
-    uint256 constant MINIMUM_LIQUIDITY = 1000;
+    uint256 constant MINIMUM_LIQUIDITY = 10000;
 
     function setUp() public {
         factory = new PaimonFactory(address(this));
